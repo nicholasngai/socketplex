@@ -2,12 +2,12 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -16,7 +16,7 @@
 static uint32_t next_id;
 
 static int handle_incoming_connection(uint32_t id, int plexfd, int serverfd,
-        int *clientfd) {
+        struct pollfd *clientfd) {
     int ret;
 
     /* Accept socket. */
@@ -42,19 +42,21 @@ static int handle_incoming_connection(uint32_t id, int plexfd, int serverfd,
         goto exit;
     }
 
-    *clientfd = cfd;
+    clientfd->fd = cfd;
+    clientfd->events = POLLIN | POLLHUP;
     ret = 0;
 
 exit:
     return ret;
 }
 
-static int handle_closed_connection(uint32_t id, int plexfd, int *clientfd) {
+static int handle_closed_connection(uint32_t id, int plexfd,
+        struct pollfd *clientfd) {
     int ret;
 
     /* Close socket. */
-    close(*clientfd);
-    *clientfd = -1;
+    close(clientfd->fd);
+    clientfd->fd = -1;
 
     /* Send close message. */
     struct socketplex_msg close_msg = {
@@ -77,11 +79,12 @@ exit:
     return ret;
 }
 
-static int handle_data_msg(int plexfd, int *clientfds, size_t clientfds_len,
-        struct socketplex_msg *msg, uint32_t id, uint32_t length) {
+static int handle_data_msg(int plexfd, struct pollfd *clientfds,
+        size_t clientfds_len, struct socketplex_msg *msg, uint32_t id,
+        uint32_t length) {
     int ret;
 
-    if (id >= clientfds_len || clientfds[id] == -1) {
+    if (id >= clientfds_len || clientfds[id].fd == -1) {
         fprintf(stderr, "Invalid incoming message ID: %u\n", id);
         ret = -1;
         goto exit;
@@ -100,7 +103,7 @@ static int handle_data_msg(int plexfd, int *clientfds, size_t clientfds_len,
         goto exit;
     }
 
-    if (do_write(clientfds[id], msg->data, length) != (int) length) {
+    if (do_write(clientfds[id].fd, msg->data, length) != (int) length) {
         fprintf(stderr, "Truncated write to client socket\n");
         ret = -1;
         goto exit;
@@ -112,7 +115,7 @@ exit:
     return ret;
 }
 
-static int handle_incoming_plex_data(int plexfd, int *clientfds,
+static int handle_incoming_plex_data(int plexfd, struct pollfd *clientfds,
         size_t clientfds_len, struct socketplex_msg *msg) {
     int ret;
 
@@ -148,12 +151,12 @@ exit:
     return ret;
 }
 
-static int handle_incoming_client_data(uint32_t id, int plexfd, int *clientfd,
-        struct socketplex_msg *msg) {
+static int handle_incoming_client_data(uint32_t id, int plexfd,
+        struct pollfd *clientfd, struct socketplex_msg *msg) {
     int ret;
 
     /* Read data. */
-    int bytes_read = read(*clientfd, msg->data, BUF_SIZE);
+    int bytes_read = read(clientfd->fd, msg->data, BUF_SIZE);
     if (bytes_read < 0) {
         perror("read");
         ret = errno;
@@ -202,57 +205,59 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Parse plex FD. */
-    int plexfd;
-    {
-        long plexfdl = strtol(argv[optind], NULL, 10);
-        if (plexfdl == LONG_MIN) {
-            fprintf(stderr, "Invalid fd: %s\n", argv[optind]);
-            ret = errno;
-            goto exit;
-        }
-        plexfd = plexfdl;
+    /* Allocate poll FD buffer. */
+    struct pollfd *pollfds = calloc(CLIENTFDS_SIZE + 2, sizeof(*pollfds));
+    if (!pollfds) {
+        perror("malloc clientfds");
+        ret = errno;
+        goto exit;
     }
+    struct pollfd *plexfd = &pollfds[0];
+    struct pollfd *serverfd = &pollfds[1];
+    struct pollfd *clientfds = pollfds + 2;
+    for (size_t i = 0; i < CLIENTFDS_SIZE; i++) {
+        clientfds[i].fd = -1;
+    }
+    size_t clientfds_len = 0;
+
+    /* Parse plex FD. */
+    long plexfdl = strtol(argv[optind], NULL, 10);
+    if (plexfdl == LONG_MIN) {
+        fprintf(stderr, "Invalid fd: %s\n", argv[optind]);
+        ret = errno;
+        goto exit_free_pollfds;
+    }
+    plexfd->fd = plexfdl;
+    plexfd->events = POLLIN | POLLHUP;
 
     /* Open server FD. */
     struct sockaddr_in addr;
     memset(&addr, '\0', sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
-    int serverfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverfd == -1) {
+    serverfd->fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverfd->fd == -1) {
         perror("socket");
         ret = errno;
-        goto exit;
+        goto exit_free_pollfds;
     }
+    serverfd->events = POLLIN;
     int one = 1;
-    if (setsockopt(serverfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
+    if (setsockopt(serverfd->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
         perror("setsockopt");
         ret = errno;
         goto exit_close_serverfd;
     }
-    if (bind(serverfd, (struct sockaddr *) &addr, sizeof(addr))) {
+    if (bind(serverfd->fd, (struct sockaddr *) &addr, sizeof(addr))) {
         perror("bind");
         ret = errno;
         goto exit_close_serverfd;
     }
-    if (listen(serverfd, 0)) {
+    if (listen(serverfd->fd, 0)) {
         perror("listen");
         ret = errno;
         goto exit_close_serverfd;
     }
-
-    /* Allocate client FD buffer. */
-    int *clientfds = calloc(CLIENTFDS_SIZE, sizeof(*clientfds));
-    if (!clientfds) {
-        perror("malloc clientfds");
-        ret = errno;
-        goto exit_close_serverfd;
-    }
-    for (size_t i = 0; i < CLIENTFDS_SIZE; i++) {
-        clientfds[i] = -1;
-    }
-    size_t clientfds_len = 0;
 
     /* Allocate data message that's also used as the buffer. */
     struct socketplex_msg *msg = malloc(sizeof(*msg) + BUF_SIZE);
@@ -261,28 +266,17 @@ int main(int argc, char **argv) {
     }
 
     for (;;) {
-        fd_set read_fds;
-
-        FD_ZERO(&read_fds);
-
-        /* Add all sockets to select. */
-        FD_SET(plexfd, &read_fds);
-        FD_SET(serverfd, &read_fds);
-        for (size_t i = 0; i < clientfds_len; i++) {
-            if (clientfds[i] != -1) {
-                FD_SET(clientfds[i], &read_fds);
-            }
-        }
-
-        /* Select. */
-        if (select(FD_SETSIZE, &read_fds, NULL, NULL, NULL) < 0) {
+        /* Poll. */
+        if (poll(pollfds, 2 + clientfds_len, -1) < 0) {
+            perror("poll");
+            ret = errno;
             goto exit_close_clientfds;
         }
 
         /* Handle plex socket. */
-        if (FD_ISSET(plexfd, &read_fds)) {
+        if (plexfd->revents) {
             ret =
-                handle_incoming_plex_data(plexfd, clientfds, clientfds_len,
+                handle_incoming_plex_data(plexfd->fd, clientfds, clientfds_len,
                         msg);
             if (ret) {
                 goto exit_close_clientfds;
@@ -290,11 +284,11 @@ int main(int argc, char **argv) {
         }
 
         /* Handle server socket. */
-        if (FD_ISSET(serverfd, &read_fds)) {
+        if (serverfd->revents) {
             uint32_t id = next_id++;
             clientfds_len++;
             ret =
-                handle_incoming_connection(id, plexfd, serverfd,
+                handle_incoming_connection(id, plexfd->fd, serverfd->fd,
                         &clientfds[clientfds_len - 1]);
             if (ret) {
                 goto exit_close_clientfds;
@@ -303,9 +297,9 @@ int main(int argc, char **argv) {
 
         /* Handle client sockets. */
         for (size_t i = 0; i < clientfds_len; i++) {
-            if (FD_ISSET(clientfds[i], &read_fds)) {
+            if (clientfds[i].revents) {
                 ret =
-                    handle_incoming_client_data(i, plexfd, &clientfds[i],
+                    handle_incoming_client_data(i, plexfd->fd, &clientfds[i],
                             msg);
                 if (ret) {
                     goto exit_close_clientfds;
@@ -316,13 +310,14 @@ int main(int argc, char **argv) {
 
 exit_close_clientfds:
     for (size_t i = 0; i < clientfds_len; i++) {
-        if (clientfds[i] != -1) {
-            close(clientfds[i]);
+        if (clientfds[i].fd != -1) {
+            close(clientfds[i].fd);
         }
     }
-    free(clientfds);
 exit_close_serverfd:
-    close(serverfd);
+    close(serverfd->fd);
+exit_free_pollfds:
+    free(pollfds);
 exit:
     return ret;
 }

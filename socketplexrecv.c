@@ -2,23 +2,24 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include "common.h"
 
-static int handle_closed_connection(uint32_t id, int plexfd, int *clientfd) {
+static int handle_closed_connection(uint32_t id, int plexfd,
+        struct pollfd *clientfd) {
     int ret;
 
     /* Close socket. */
-    close(*clientfd);
-    *clientfd = -1;
+    close(clientfd->fd);
+    clientfd->fd = -1;
 
     /* Send open message. */
     struct socketplex_msg close_msg = {
@@ -41,12 +42,12 @@ exit:
     return ret;
 }
 
-static int handle_incoming_client_data(uint32_t id, int plexfd, int *clientfd,
-        struct socketplex_msg *msg) {
+static int handle_incoming_client_data(uint32_t id, int plexfd,
+        struct pollfd *clientfd, struct socketplex_msg *msg) {
     int ret;
 
     /* Read data. */
-    int bytes_read = read(*clientfd, msg->data, BUF_SIZE);
+    int bytes_read = read(clientfd->fd, msg->data, BUF_SIZE);
     if (bytes_read < 0) {
         perror("read");
         ret = errno;
@@ -73,7 +74,8 @@ exit:
     return ret;
 }
 
-static int handle_open_msg(int *clientfds, size_t *clientfds_len, int port) {
+static int handle_open_msg(struct pollfd *clientfds, size_t *clientfds_len,
+        int port) {
     int ret;
 
     /* Open a new socket to the target. */
@@ -95,7 +97,8 @@ static int handle_open_msg(int *clientfds, size_t *clientfds_len, int port) {
     }
 
     (*clientfds_len)++;
-    clientfds[*clientfds_len - 1] = cfd;
+    clientfds[*clientfds_len - 1].fd = cfd;
+    clientfds[*clientfds_len - 1].events = POLLIN | POLLHUP;
 
     return 0;
 
@@ -105,19 +108,19 @@ exit:
     return ret;
 }
 
-static int handle_close_msg(int *clientfds, size_t *clientfds_len,
+static int handle_close_msg(struct pollfd *clientfds, size_t *clientfds_len,
         uint32_t id) {
     int ret;
 
-    if (id >= *clientfds_len || clientfds[id] == -1) {
+    if (id >= *clientfds_len || clientfds[id].fd == -1) {
         fprintf(stderr, "Invalid incoming message ID: %u\n", id);
         ret = -1;
         goto exit;
     }
 
     /* Close the socket. */
-    close(clientfds[id]);
-    clientfds[id] = -1;
+    close(clientfds[id].fd);
+    clientfds[id].fd = -1;
 
     ret = 0;
 
@@ -125,11 +128,12 @@ exit:
     return ret;
 }
 
-static int handle_data_msg(int plexfd, int *clientfds, size_t *clientfds_len,
-        struct socketplex_msg *msg, uint32_t id, uint32_t length) {
+static int handle_data_msg(int plexfd, struct pollfd *clientfds,
+        size_t *clientfds_len, struct socketplex_msg *msg, uint32_t id,
+        uint32_t length) {
     int ret;
 
-    if (id >= *clientfds_len || clientfds[id] == -1) {
+    if (id >= *clientfds_len || clientfds[id].fd == -1) {
         fprintf(stderr, "Invalid incoming message ID: %u\n", id);
         ret = -1;
         goto exit;
@@ -148,7 +152,7 @@ static int handle_data_msg(int plexfd, int *clientfds, size_t *clientfds_len,
         goto exit;
     }
 
-    if (do_write(clientfds[id], msg->data, length) != (int) length) {
+    if (do_write(clientfds[id].fd, msg->data, length) != (int) length) {
         fprintf(stderr, "Truncated write to client socket\n");
         ret = -1;
         goto exit;
@@ -160,7 +164,7 @@ exit:
     return ret;
 }
 
-static int handle_incoming_plex_data(int plexfd, int *clientfds,
+static int handle_incoming_plex_data(int plexfd, struct pollfd *clientfds,
         size_t *clientfds_len, struct socketplex_msg *msg, int port) {
     int ret;
 
@@ -233,29 +237,29 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* Parse plex FD. */
-    int plexfd;
-    {
-        long plexfdl = strtol(argv[optind], NULL, 10);
-        if (plexfdl == LONG_MIN) {
-            fprintf(stderr, "Invalid fd: %s\n", argv[optind]);
-            ret = errno;
-            goto exit;
-        }
-        plexfd = plexfdl;
-    }
-
-    /* Allocate client FD buffer. */
-    int *clientfds = calloc(CLIENTFDS_SIZE, sizeof(*clientfds));
-    if (!clientfds) {
+    /* Allocate poll FD buffer. */
+    struct pollfd *pollfds = calloc(CLIENTFDS_SIZE + 1, sizeof(*pollfds));
+    if (!pollfds) {
         perror("malloc clientfds");
         ret = errno;
         goto exit;
     }
+    struct pollfd *plexfd = &pollfds[0];
+    struct pollfd *clientfds = pollfds + 1;
     for (size_t i = 0; i < CLIENTFDS_SIZE; i++) {
-        clientfds[i] = -1;
+        clientfds[i].fd = -1;
     }
     size_t clientfds_len = 0;
+
+    /* Parse plex FD. */
+    long plexfdl = strtol(argv[optind], NULL, 10);
+    if (plexfdl == LONG_MIN) {
+        fprintf(stderr, "Invalid fd: %s\n", argv[optind]);
+        ret = errno;
+        goto exit;
+    }
+    plexfd->fd = plexfdl;
+    plexfd->events = POLLIN | POLLHUP;
 
     /* Allocate data message that's also used as the buffer. */
     struct socketplex_msg *msg = malloc(sizeof(*msg) + BUF_SIZE);
@@ -264,27 +268,17 @@ int main(int argc, char **argv) {
     }
 
     for (;;) {
-        fd_set read_fds;
-
-        FD_ZERO(&read_fds);
-
-        /* Add all sockets to select. */
-        FD_SET(plexfd, &read_fds);
-        for (size_t i = 0; i < clientfds_len; i++) {
-            if (clientfds[i] != -1) {
-                FD_SET(clientfds[i], &read_fds);
-            }
-        }
-
-        /* Select. */
-        if (select(FD_SETSIZE, &read_fds, NULL, NULL, NULL) < 0) {
+        /* Poll. */
+        if (poll(pollfds, 1 + clientfds_len, -1) < 0) {
+            perror("poll");
+            ret = errno;
             goto exit_close_clientfds;
         }
 
         /* Handle plex socket. */
-        if (FD_ISSET(plexfd, &read_fds)) {
+        if (plexfd->revents) {
             ret =
-                handle_incoming_plex_data(plexfd, clientfds, &clientfds_len,
+                handle_incoming_plex_data(plexfd->fd, clientfds, &clientfds_len,
                         msg, port);
             if (ret) {
                 goto exit_close_clientfds;
@@ -293,9 +287,9 @@ int main(int argc, char **argv) {
 
         /* Handle client sockets. */
         for (size_t i = 0; i < clientfds_len; i++) {
-            if (FD_ISSET(clientfds[i], &read_fds)) {
+            if (clientfds[i].revents) {
                 ret =
-                    handle_incoming_client_data(i, plexfd, &clientfds[i],
+                    handle_incoming_client_data(i, plexfd->fd, &clientfds[i],
                             msg);
                 if (ret) {
                     goto exit_close_clientfds;
@@ -306,11 +300,11 @@ int main(int argc, char **argv) {
 
 exit_close_clientfds:
     for (size_t i = 0; i < clientfds_len; i++) {
-        if (clientfds[i] != -1) {
-            close(clientfds[i]);
+        if (clientfds[i].fd != -1) {
+            close(clientfds[i].fd);
         }
     }
-    free(clientfds);
+    free(pollfds);
 exit:
     return ret;
 }
