@@ -1,7 +1,8 @@
 TARGETS = \
 	socketplexsend
+DEPS = $(TARGETS:=.d)
 
-CPPFLAGS =
+CPPFLAGS = -MMD
 CFLAGS = -std=c11 -pedantic -pedantic-errors -Wall -Wextra -O3
 LDFLAGS =
 LDLIBS =
@@ -12,3 +13,5 @@ all: $(TARGETS)
 .PHONY: clean
 clean:
 	rm -rf $(TARGETS)
+
+-include $(DEPS)
