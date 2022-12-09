@@ -2,7 +2,6 @@
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,7 +13,7 @@
 #include <unistd.h>
 #include "common.h"
 
-static atomic_ulong next_id;
+static uint32_t next_id;
 
 static int do_read(int fd, void *buf, size_t len) {
     int ret = 0;
