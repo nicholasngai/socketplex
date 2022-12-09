@@ -1,4 +1,5 @@
 TARGETS = \
+	socketplexrecv \
 	socketplexsend
 DEPS = $(TARGETS:=.d)
 
