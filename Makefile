@@ -1,18 +1,19 @@
-TARGETS = \
-	socketplexrecv \
-	socketplexsend
-DEPS = $(TARGETS:=.d)
+TARGET = socketplex
+OBJS = socketplex.o
+DEPS = $(OBJS:=.d)
 
 CPPFLAGS = -MMD
-CFLAGS = -std=c11 -pedantic -pedantic-errors -Wall -Wextra -O3
+CFLAGS = -std=c11 -pedantic -pedantic-errors -Wall -Wextra -O3 -ggdb -g3
 LDFLAGS =
 LDLIBS =
 
 .PHONY: all
-all: $(TARGETS)
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
 
 .PHONY: clean
 clean:
-	rm -rf $(TARGETS)
+	rm -rf $(TARGET)
 
 -include $(DEPS)
