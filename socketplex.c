@@ -3,6 +3,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include "common.h"
 
 static uint32_t next_id;
+bool verbose;
 
 static int handle_incoming_connection(uint32_t id, int plexfd, int serverfd,
         struct pollfd *clientfd) {
@@ -45,6 +47,10 @@ static int handle_incoming_connection(uint32_t id, int plexfd, int serverfd,
     clientfd->fd = cfd;
     clientfd->events = POLLIN | POLLHUP;
     ret = 0;
+
+    if (verbose) {
+        printf("Received new incoming connection with ID %u\n", id);
+    }
 
 exit:
     return ret;
@@ -84,6 +90,12 @@ static int handle_open_msg(struct pollfd *clientfds, size_t *clientfds_len,
         int out_port) {
     int ret;
 
+    if (out_port == -1) {
+        fprintf(stderr, "Received open msg without specified output port\n");
+        ret = -1;
+        goto exit;
+    }
+
     /* Open a new socket to the target. */
     int cfd = socket(AF_INET, SOCK_STREAM, 0);
     if (cfd == -1) {
@@ -106,6 +118,11 @@ static int handle_open_msg(struct pollfd *clientfds, size_t *clientfds_len,
     clientfds[*clientfds_len - 1].fd = cfd;
     clientfds[*clientfds_len - 1].events = POLLIN | POLLHUP;
 
+    if (verbose) {
+        printf("Opened new outgoing connection to port %d with ID %lu\n",
+                out_port, *clientfds_len - 1);
+    }
+
     return 0;
 
 exit_close_cfd:
@@ -127,6 +144,10 @@ static int handle_close_msg(struct pollfd *clientfds, size_t *clientfds_len,
     /* Close the socket. */
     close(clientfds[id].fd);
     clientfds[id].fd = -1;
+
+    if (verbose) {
+        printf("Closed outgoing connection with ID %u\n", id);
+    }
 
     ret = 0;
 
@@ -259,7 +280,7 @@ int main(int argc, char **argv) {
     long in_port = -1;
     long out_port = -1;
     int opt;
-    while ((opt = getopt(argc, argv, "i:o:")) != -1) {
+    while ((opt = getopt(argc, argv, "i:o:v")) != -1) {
         switch (opt) {
         case 'i':
             in_port = strtol(optarg, NULL, 10);
@@ -275,11 +296,14 @@ int main(int argc, char **argv) {
                 return 1;
             }
             break;
+        case 'v':
+            verbose = true;
+            break;
         }
     }
 
     if ((in_port == -1 && out_port == -1) || argc - optind != 1) {
-        printf("usage: %s [-i IN_PORT] [-o OUT_PORT] SOCKET\n", argv[0]);
+        printf("usage: %s [-i IN_PORT] [-o OUT_PORT] [-v] SOCKET\n", argv[0]);
         return 1;
     }
 
@@ -309,32 +333,40 @@ int main(int argc, char **argv) {
     plexfd->events = POLLIN | POLLHUP;
 
     /* Open server FD. */
-    struct sockaddr_in addr;
-    memset(&addr, '\0', sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(in_port);
-    serverfd->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverfd->fd == -1) {
-        perror("socket");
-        ret = errno;
-        goto exit_free_pollfds;
-    }
-    serverfd->events = POLLIN;
-    int one = 1;
-    if (setsockopt(serverfd->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
-        perror("setsockopt");
-        ret = errno;
-        goto exit_close_serverfd;
-    }
-    if (bind(serverfd->fd, (struct sockaddr *) &addr, sizeof(addr))) {
-        perror("bind");
-        ret = errno;
-        goto exit_close_serverfd;
-    }
-    if (listen(serverfd->fd, 0)) {
-        perror("listen");
-        ret = errno;
-        goto exit_close_serverfd;
+    if (in_port != -1) {
+        struct sockaddr_in addr;
+        memset(&addr, '\0', sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(in_port);
+        serverfd->fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (serverfd->fd == -1) {
+            perror("socket");
+            ret = errno;
+            goto exit_free_pollfds;
+        }
+        serverfd->events = POLLIN;
+        int one = 1;
+        if (setsockopt(serverfd->fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
+            perror("setsockopt");
+            ret = errno;
+            goto exit_close_serverfd;
+        }
+        if (bind(serverfd->fd, (struct sockaddr *) &addr, sizeof(addr))) {
+            perror("bind");
+            ret = errno;
+            goto exit_close_serverfd;
+        }
+        if (listen(serverfd->fd, 0)) {
+            perror("listen");
+            ret = errno;
+            goto exit_close_serverfd;
+        }
+
+        if (verbose) {
+            printf("Listening on input port %ld\n", in_port);
+        }
+    } else {
+        serverfd->fd = -1;
     }
 
     /* Allocate data message that's also used as the buffer. */
